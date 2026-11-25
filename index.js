@@ -1783,6 +1783,68 @@ function hsjsLogBox(key) {
   if (!box) { box = { lines: [] }; HSJS_LOGS.set(key, box); }
   return box;
 }
+/* ===== 诊断日志上报（Cloudflare Tunnel → api.1009.de5.net/diag-report）=====
+ * 所有请求经 hsjsPushLog（req 带耗时+摘要，error 带异常），此处异步批量上报。
+ * 缓冲满 8 条或 5s 触发；失败静默不阻塞源逻辑。 */
+var __HS_UP = { url: "https://api.1009.de5.net/diag-report", buf: [], timer: 0, ready: true };
+var __HS_DEV = { id: "", ver: "2026-11-25" };
+function __hsDeviceId() {
+  try {
+    if (__HS_DEV.id) return __HS_DEV.id;
+    var __f = require("fs"), __p = require("path");
+    var __fp = __p.join(hsjsDir(), ".hsDiagDev");
+    try { __HS_DEV.id = String(__f.readFileSync(__fp, "utf8") || "").trim(); } catch (e) { }
+    if (!__HS_DEV.id) {
+      __HS_DEV.id = "d" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+      try { __f.writeFileSync(__fp, __HS_DEV.id, "utf8"); } catch (e) { }
+    }
+  } catch (e) { }
+  return __HS_DEV.id || "unknown";
+}
+function __hsSlim(v, max) {
+  try {
+    if (v === null || v === undefined) return "";
+    if (typeof v === "string") return v.slice(0, max || 500);
+    var s2 = JSON.stringify(v);
+    return s2.length > (max || 700) ? s2.slice(0, max || 700) + "…" : s2;
+  } catch (e) { return ""; }
+}
+function __hsDiag(o) {
+  try {
+    if (!__HS_UP.ready || !o) return;
+    var rq = o.request || {};
+    var it = {
+      kind: o.kind || "req", src: String(o.src || "").slice(0, 80),
+      method: o.method || "", route: o.rest || "", cost: o.cost || 0,
+      ok: !!o.ok, status: o.status || 0, cache: o.cache || "",
+      dev: __hsDeviceId(), ver: __HS_DEV.ver, ts: Date.now(),
+      query: __hsSlim(rq.query), body: __hsSlim(rq.body),
+      out: __hsSlim(o.out), err: o.err ? String(o.err).slice(0, 500) : "",
+      stack: o.stack ? String(o.stack).slice(0, 600) : ""
+    };
+    __HS_UP.buf.push(it);
+    if (__HS_UP.buf.length >= 8) __hsFlush();
+    else if (!__HS_UP.timer) __HS_UP.timer = setTimeout(__hsFlush, 5000);
+  } catch (e) { }
+}
+function __hsFlush() {
+  try {
+    if (__HS_UP.timer) { clearTimeout(__HS_UP.timer); __HS_UP.timer = 0; }
+    var b = __HS_UP.buf; __HS_UP.buf = [];
+    if (!b.length) return;
+    var body = JSON.stringify({ logs: b });
+    if (typeof fetch === "function") {
+      fetch(__HS_UP.url, { method: "POST", headers: { "Content-Type": "application/json" }, body: body }).catch(function () { });
+      return;
+    }
+    var __u = new URL(__HS_UP.url);
+    var __lib = __u.protocol === "https:" ? require("https") : require("http");
+    var __r = __lib.request({ hostname: __u.hostname, port: __u.port || (__u.protocol === "https:" ? 443 : 80), path: __u.pathname + (__u.search || ""), method: "POST", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) }, timeout: 8000 }, function (res) { try { res.resume(); } catch (e) { } });
+    __r.on("error", function () { });
+    __r.on("timeout", function () { try { __r.destroy(); } catch (e) { } });
+    __r.write(body); __r.end();
+  } catch (e) { }
+}
 function hsjsPushLog(key, lvl, msg) {
   if (!key) key = "-";
   var box = hsjsLogBox(key);
@@ -2815,6 +2877,7 @@ async function hsJsDispatch(request, reply) {
           var __ce = HSJS_PLAY_CACHE.get(__pk);
           if (__ce && Date.now() - __ce.at < (rest === "/play" ? HSJS_PLAY_TTL : HSJS_DETAIL_TTL)) {
             hsjsPushLog(key, "req", "POST " + rest + " -> cache (" + (Date.now() - __t0) + "ms)");
+            __hsDiag({ src: key, method: method, rest: rest, cost: Date.now() - __t0, ok: true, status: 200, cache: "hit", request: request });
             return JSON.parse(__ce.json);
           }
           /* P-B：该线路正在后台预热 → 复用同一份结果（不重复打上游） */
@@ -2824,6 +2887,7 @@ async function hsJsDispatch(request, reply) {
             var __cw = HSJS_PLAY_CACHE.get(__pk);
             if (__cw && Date.now() - __cw.at < (rest === "/play" ? HSJS_PLAY_TTL : HSJS_DETAIL_TTL)) {
               hsjsPushLog(key, "req", "POST " + rest + " -> warm-hit (" + (Date.now() - __t0) + "ms)");
+              __hsDiag({ src: key, method: method, rest: rest, cost: Date.now() - __t0, ok: true, status: 200, cache: "warm", request: request });
               return JSON.parse(__cw.json);
             }
           }
@@ -2831,6 +2895,7 @@ async function hsJsDispatch(request, reply) {
           var __fe = HSJS_PLAY_FAIL.get(__pk);
           if (__fe && Date.now() - __fe.at < HSJS_PLAY_FAIL_TTL) {
             hsjsPushLog(key, "req", "POST " + rest + " -> fail-cache (" + (Date.now() - __t0) + "ms)");
+            __hsDiag({ src: key, method: method, rest: rest, cost: Date.now() - __t0, ok: false, status: 200, cache: "fail", request: request });
             return JSON.parse(__fe.json);
           }
         }
@@ -2858,9 +2923,11 @@ async function hsJsDispatch(request, reply) {
     try { hsjsAfterDispatch(key, type, rest, method, request, reply, out, handler); } catch (eW) { }
     hsjsPushLog(key, "req", method.toUpperCase() + " " + rest + " → " + (reply.statusCode || 200) +
       " (" + (Date.now() - __t0) + "ms)" + hsjsSummarize(out));
+    __hsDiag({ src: key, method: method, rest: rest, cost: Date.now() - __t0, ok: true, status: reply.statusCode || 200, request: request, out: out });
     return out;
   } catch (err) {
     hsjsPushLog(key, "error", method.toUpperCase() + " " + rest + " → 异常：" + ((err && err.message) || err));
+    __hsDiag({ kind: "error", src: key, method: method, rest: rest, cost: Date.now() - __t0, ok: false, status: 500, request: request, err: (err && err.message) || String(err), stack: (err && err.stack) || "" });
     console.error("[hsjs] 处理 " + lookup + " 出错：" + ((err && err.message) || err));
     throw err;
   }
